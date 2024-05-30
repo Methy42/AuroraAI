@@ -1,126 +1,409 @@
-import { Audio } from 'expo-av';
-import { useEffect, useState } from "react";
-import { Text, StyleSheet, View } from "react-native";
-import { initWhisper, AudioSessionIos } from 'whisper.rn'
+import React, { useCallback, useState } from 'react'
+import {
+  StyleSheet,
+  ScrollView,
+  View,
+  Text,
+  TouchableOpacity,
+  SafeAreaView,
+  Platform,
+  PermissionsAndroid,
+} from 'react-native'
+import RNFS from 'react-native-fs'
+import { unzip } from 'react-native-zip-archive'
+import Sound from 'react-native-sound'
+import { initWhisper, libVersion, AudioSessionIos } from 'whisper.rn' // whisper.rn
+import type { WhisperContext } from 'whisper.rn'
+import contextOpts from './context-opts'
 
-export default function () {
-    const [permissionResponse, requestPermission] = Audio.usePermissions();
+const sampleFile = require('../assets/1716877265707-record.wav')
 
-    const requestRecordingPermission = async () => {
-        if (permissionResponse?.status !== 'granted') {
-            console.log('Requesting permission..');
-            await requestPermission();
-        }
-        await Audio.setAudioModeAsync({
-            allowsRecordingIOS: true,
-            playsInSilentModeIOS: true,
-        });
-    }
-
-    const initListener = async () => {
-        console.log("start init whisper");
-
-        const whisperContext = await initWhisper({
-            filePath: require('../assets/whisper/ggml-small.bin'),
-        });
-
-        console.log("start realtime transcribe");
-
-        const { stop, subscribe } = await whisperContext.transcribeRealtime({
-            realtimeAudioSec: 10,
-            realtimeAudioSliceSec: 5
-        });
-
-        subscribe(evt => {
-            const { isCapturing, data, processTime, recordingTime } = evt
-            console.log(
-                `Realtime transcribing: ${isCapturing ? 'ON' : 'OFF'}\n` +
-                // The inference text result from audio record:
-                `Result: ${data?.result}\n\n` +
-                `Process time: ${processTime}ms\n` +
-                `Recording time: ${recordingTime}ms`,
-            )
-            if (!isCapturing) console.log('Finished realtime transcribing')
-        })
-
-        console.log('init listener');
-    }
-
-    useEffect(() => {
-        console.log("model path", require('../assets/whisper/ggml-small.bin'));
-        console.log("icon path", require('../assets/images/icon.png'));
-
-        requestRecordingPermission().then(() => {
-            // initListener();
-        }).catch((error) => {
-            console.error("Failed to request recording permission", error);
-        });
-    }, []);
-
-    return (
-        <View style={styles.container}>
-            <View style={styles.floatingBall}></View>
-            <View style={styles.responseContainer}>
-                <Text style={styles.statusText}>[贾维斯正在聆听...]</Text>
-                <Text style={styles.inputText}>来听我弹吉他吧，你听这段旋律怎么样</Text>
-                <Text style={styles.outputText}>听起来很不错，尤其是开头那段泛音的部分，简直绝了！</Text>
-            </View>
-        </View>
-    );
+if (Platform.OS === 'android') {
+  // Request record audio permission
+  // @ts-ignore
+  PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO, {
+    title: 'Whisper Audio Permission',
+    message: 'Whisper needs access to your microphone',
+    buttonNeutral: 'Ask Me Later',
+    buttonNegative: 'Cancel',
+    buttonPositive: 'OK',
+  })
 }
 
 const styles = StyleSheet.create({
-    container: {
-        width: '100%',
-        height: '100%',
-        position: 'relative',
-        backgroundColor: '#000000'
+  scrollview: { flexGrow: 1, justifyContent: 'center' },
+  container: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 4,
+  },
+  buttons: { flexDirection: 'row' },
+  button: { margin: 4, backgroundColor: '#333', borderRadius: 4, padding: 8 },
+  buttonClear: { backgroundColor: '#888' },
+  buttonText: { fontSize: 14, color: 'white', textAlign: 'center' },
+  logContainer: {
+    backgroundColor: 'lightgray',
+    padding: 8,
+    width: '95%',
+    borderRadius: 8,
+    marginVertical: 8,
+  },
+  logText: { fontSize: 12, color: '#333' },
+})
+
+function toTimestamp(t: number, comma = false) {
+  let msec = t * 10
+  const hr = Math.floor(msec / (1000 * 60 * 60))
+  msec -= hr * (1000 * 60 * 60)
+  const min = Math.floor(msec / (1000 * 60))
+  msec -= min * (1000 * 60)
+  const sec = Math.floor(msec / 1000)
+  msec -= sec * 1000
+
+  const separator = comma ? ',' : '.'
+  const timestamp = `${String(hr).padStart(2, '0')}:${String(min).padStart(
+    2,
+    '0',
+  )}:${String(sec).padStart(2, '0')}${separator}${String(msec).padStart(
+    3,
+    '0',
+  )}`
+
+  return timestamp
+}
+
+const mode = process.env.NODE_ENV === 'development' ? 'debug' : 'release'
+
+const fileDir = `${RNFS.DocumentDirectoryPath}/whisper`
+
+console.log('[App] fileDir', fileDir)
+
+const recordFile = `${fileDir}/realtime.wav`
+
+const modelHost = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main'
+
+const createDir = async (log: any) => {
+  if (!(await RNFS.exists(fileDir))) {
+    log('Create dir', fileDir)
+    await RNFS.mkdir(fileDir)
+  }
+}
+
+const filterPath = (path: string) =>
+  path.replace(RNFS.DocumentDirectoryPath, '<DocumentDir>')
+
+export default function App() {
+  const [whisperContext, setWhisperContext] = useState<WhisperContext | null>(
+    null,
+  )
+  const [logs, setLogs] = useState([`whisper.cpp version: ${libVersion}`])
+  const [transcibeResult, setTranscibeResult] = useState<string | null>(null)
+  const [stopTranscribe, setStopTranscribe] = useState<{
+    stop: () => void
+  } | null>(null)
+
+  const log = useCallback((...messages: any[]) => {
+    setLogs((prev) => [...prev, messages.join(' ')])
+  }, [])
+
+  const progress = useCallback(
+    ({
+      contentLength,
+      bytesWritten,
+    }: {
+      contentLength: number
+      bytesWritten: number
+    }) => {
+      const written = bytesWritten >= 0 ? bytesWritten : 0
+      log(`Download progress: ${Math.round((written / contentLength) * 100)}%`)
     },
-    floatingBall: {
-        width: 30,
-        height: 30,
-        borderRadius: 15,
-        backgroundColor: '#66ccff',
-        shadowColor: '#336688',
-        shadowOffset: {
-            width: 3,
-            height: 3
-        },
-        shadowOpacity: 0.7,
-        shadowRadius: 4,
-        position: 'absolute',
-        bottom: 30,
-        right: 30
-    },
-    responseContainer: {
-        position: 'absolute',
-        bottom: 30,
-        right: 75,
-        borderRadius: 5,
-        backgroundColor: 'rgba(255, 255, 255, 0.3)',
-        shadowColor: 'rgba(255, 255, 255, 0.1)',
-        shadowOffset: {
-            width: 3,
-            height: 3
-        },
-        shadowOpacity: 0.7,
-        shadowRadius: 4,
-        padding: 5
-    },
-    statusText: {
-        color: '#cecece'
-    },
-    inputText: {
-        color: '#efefef'
-    },
-    outputText: {
-        color: '#cceeff'
-    },
-    baseText: {
-        fontFamily: 'Cochin',
-    },
-    titleText: {
-        fontSize: 20,
-        fontWeight: 'bold',
-    },
-});
+    [log],
+  )
+
+  return (
+    <ScrollView
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={styles.scrollview}
+    >
+      <SafeAreaView style={styles.container}>
+        <View style={styles.buttons}>
+          <TouchableOpacity
+            style={styles.button}
+            onPress={async () => {
+              if (whisperContext) {
+                log('Found previous context')
+                await whisperContext.release()
+                setWhisperContext(null)
+                log('Released previous context')
+              }
+              log('Initialize context...')
+              const startTime = Date.now()
+              const ctx = await initWhisper({
+                filePath: require('../assets/models/whisper.cpp/ggml-small.bin'),
+                ...contextOpts,
+              })
+              const endTime = Date.now()
+              log('Loaded model, ID:', ctx.id)
+              log('Loaded model in', endTime - startTime, `ms in ${mode} mode`)
+              setWhisperContext(ctx)
+            }}
+          >
+            <Text style={styles.buttonText}>Initialize (Use Asset)</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.button}
+            onPress={async () => {
+              if (whisperContext) {
+                log('Found previous context')
+                await whisperContext.release()
+                setWhisperContext(null)
+                log('Released previous context')
+              }
+              await createDir(log)
+              const modelFilePath = `${fileDir}/ggml-base.bin`
+              if (await RNFS.exists(modelFilePath)) {
+                log('Model already exists:')
+                log(filterPath(modelFilePath))
+              } else {
+                log('Start Download Model to:')
+                log(filterPath(modelFilePath))
+                await RNFS.downloadFile({
+                  fromUrl: `${modelHost}/ggml-base.bin`,
+                  toFile: modelFilePath,
+                  progressInterval: 1000,
+                  begin: () => {},
+                  progress,
+                }).promise
+                log('Downloaded model file:')
+                log(filterPath(modelFilePath))
+              }
+
+              // If you don't want to enable Core ML, you can remove this
+              const coremlModelFilePath = `${fileDir}/ggml-base-encoder.mlmodelc.zip`
+              if (
+                Platform.OS === 'ios' &&
+                (await RNFS.exists(coremlModelFilePath))
+              ) {
+                log('Core ML Model already exists:')
+                log(filterPath(coremlModelFilePath))
+              } else if (Platform.OS === 'ios') {
+                log('Start Download Core ML Model to:')
+                log(filterPath(coremlModelFilePath))
+                await RNFS.downloadFile({
+                  fromUrl: `${modelHost}/ggml-base-encoder.mlmodelc.zip`,
+                  toFile: coremlModelFilePath,
+                  progressInterval: 1000,
+                  begin: () => {},
+                  progress,
+                }).promise
+                log('Downloaded Core ML Model model file:')
+                log(filterPath(modelFilePath))
+                await unzip(coremlModelFilePath, fileDir)
+                log('Unzipped Core ML Model model successfully.')
+              }
+
+              log('Initialize context...')
+              const startTime = Date.now()
+              const ctx = await initWhisper({ filePath: modelFilePath })
+              const endTime = Date.now()
+              log('Loaded model, ID:', ctx.id)
+              log('Loaded model in', endTime - startTime, `ms in ${mode} mode`)
+              setWhisperContext(ctx)
+            }}
+          >
+            <Text style={styles.buttonText}>Initialize (Download)</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.buttons}>
+          <TouchableOpacity
+            style={styles.button}
+            disabled={!!stopTranscribe?.stop}
+            onPress={async () => {
+              if (!whisperContext) return log('No context')
+
+              log('Start transcribing...')
+              const startTime = Date.now()
+              const { stop, promise } = whisperContext.transcribe(sampleFile, {
+                maxLen: 1,
+                tokenTimestamps: true,
+                onProgress: (cur: any) => {
+                  log(`Transcribing progress: ${cur}%`)
+                },
+                language: 'zh',
+                // prompt: 'HELLO WORLD',
+                // onNewSegments: (segments) => {
+                //   console.log('New segments:', segments)
+                // },
+              })
+              setStopTranscribe({ stop })
+              const { result, segments } = await promise
+              const endTime = Date.now()
+              setStopTranscribe(null)
+              setTranscibeResult(
+                `Transcribed result: ${result}\n` +
+                  `Transcribed in ${endTime - startTime}ms in ${mode} mode` +
+                  `\n` +
+                  `Segments:` +
+                  `\n${segments
+                    .map(
+                      (segment: any) =>
+                        `[${toTimestamp(segment.t0)} --> ${toTimestamp(
+                          segment.t1,
+                        )}]  ${segment.text}`,
+                    )
+                    .join('\n')}`,
+              )
+              log('Finished transcribing')
+            }}
+          >
+            <Text style={styles.buttonText}>Transcribe File</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.button,
+              stopTranscribe?.stop ? styles.buttonClear : null,
+            ]}
+            onPress={async () => {
+              if (!whisperContext) return log('No context')
+              if (stopTranscribe?.stop) {
+                const t0 = Date.now()
+                await stopTranscribe?.stop()
+                const t1 = Date.now()
+                log('Stopped transcribing in', t1 - t0, 'ms')
+                setStopTranscribe(null)
+                return
+              }
+              log('Start realtime transcribing...')
+              try {
+                await createDir(log)
+                const { stop, subscribe } =
+                  await whisperContext.transcribeRealtime({
+                    maxLen: 1,
+                    language: 'en',
+                    // Enable beam search (may be slower than greedy but more accurate)
+                    // beamSize: 2,
+                    // Record duration in seconds
+                    realtimeAudioSec: 60,
+                    // Slice audio into 25 (or < 30) sec chunks for better performance
+                    realtimeAudioSliceSec: 25,
+                    // Save audio on stop
+                    audioOutputPath: recordFile,
+                    // iOS Audio Session
+                    audioSessionOnStartIos: {
+                      category: AudioSessionIos.Category.PlayAndRecord,
+                      options: [
+                        AudioSessionIos.CategoryOption.MixWithOthers,
+                        AudioSessionIos.CategoryOption.AllowBluetooth,
+                      ],
+                      mode: AudioSessionIos.Mode.Default,
+                    },
+                    audioSessionOnStopIos: 'restore', // Or an AudioSessionSettingIos
+                    // Voice Activity Detection - Start transcribing when speech is detected
+                    // useVad: true,
+                  })
+                setStopTranscribe({ stop })
+                subscribe((evt: any) => {
+                  const { isCapturing, data, processTime, recordingTime } = evt
+                  setTranscibeResult(
+                    `Realtime transcribing: ${isCapturing ? 'ON' : 'OFF'}\n` +
+                      `Result: ${data?.result}\n\n` +
+                      `Process time: ${processTime}ms\n` +
+                      `Recording time: ${recordingTime}ms` +
+                      `\n` +
+                      `Segments:` +
+                      `\n${data?.segments
+                        .map(
+                          (segment: any) =>
+                            `[${toTimestamp(segment.t0)} --> ${toTimestamp(
+                              segment.t1,
+                            )}]  ${segment.text}`,
+                        )
+                        .join('\n')}`,
+                  )
+                  if (!isCapturing) {
+                    setStopTranscribe(null)
+                    log('Finished realtime transcribing')
+                  }
+                })
+              } catch (e) {
+                log('Error:', e)
+              }
+            }}
+          >
+            <Text style={styles.buttonText}>
+              {stopTranscribe?.stop ? 'Stop' : 'Realtime'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.logContainer}>
+          {logs.map((msg, index) => (
+            <Text key={index} style={styles.logText}>
+              {msg}
+            </Text>
+          ))}
+        </View>
+        {transcibeResult && (
+          <View style={styles.logContainer}>
+            <Text style={styles.logText}>{transcibeResult}</Text>
+          </View>
+        )}
+
+        <TouchableOpacity
+          style={[styles.button, styles.buttonClear]}
+          onPress={async () => {
+            if (!whisperContext) return
+            await whisperContext.release()
+            setWhisperContext(null)
+            log('Released context')
+          }}
+        >
+          <Text style={styles.buttonText}>Release Context</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.button, styles.buttonClear]}
+          onPress={() => {
+            setLogs([])
+            setTranscibeResult('')
+          }}
+        >
+          <Text style={styles.buttonText}>Clear Logs</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.button, styles.buttonClear]}
+          onPress={async () => {
+            await RNFS.unlink(fileDir).catch(() => {})
+            log('Deleted files')
+          }}
+        >
+          <Text style={styles.buttonText}>Clear Download files</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.button, styles.buttonClear]}
+          onPress={async () => {
+            if (!(await RNFS.exists(recordFile))) {
+              log('Recorded file does not exist')
+              return
+            }
+            const player = new Sound(recordFile, '', (e: any) => {
+              if (e) {
+                log('error', e)
+                return
+              }
+              player.play((success: any) => {
+                if (success) {
+                  log('successfully finished playing')
+                } else {
+                  log('playback failed due to audio decoding errors')
+                }
+                player.release()
+              })
+            })
+          }}
+        >
+          <Text style={styles.buttonText}>Play Recorded file</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    </ScrollView>
+  )
+}
